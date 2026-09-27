@@ -25,9 +25,9 @@ CLAIM_TRANSITIONS = {
 
 
 class BusinessError(Exception):
-    def __init__(self, message, status=400, code="bad_request"):
+    def __init__(self, message, status=400, code="bad_request", details=None):
         super().__init__(message)
-        self.message, self.status, self.code = message, status, code
+        self.message, self.status, self.code, self.details = message, status, code, details
 
 
 def now():
@@ -100,6 +100,24 @@ class ProvenanceStore:
                     old_status TEXT NOT NULL, new_status TEXT NOT NULL,
                     note TEXT NOT NULL, created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS supplement_requests(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    claim_id INTEGER NOT NULL REFERENCES claims(id),
+                    material_category TEXT NOT NULL, description TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'open'
+                        CHECK(status IN ('open','submitted','closed')),
+                    requested_by TEXT NOT NULL REFERENCES users(id),
+                    created_at TEXT NOT NULL,
+                    responded_at TEXT, reviewed_at TEXT,
+                    review_note TEXT, reviewed_by TEXT REFERENCES users(id)
+                );
+                CREATE TABLE IF NOT EXISTS supplement_materials(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    request_id INTEGER NOT NULL REFERENCES supplement_requests(id),
+                    filename TEXT NOT NULL, sha256 TEXT NOT NULL, size INTEGER NOT NULL,
+                    content BLOB NOT NULL,
+                    uploaded_by TEXT NOT NULL REFERENCES users(id), created_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS object_versions(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     object_id INTEGER NOT NULL REFERENCES objects(id),
@@ -156,11 +174,25 @@ class ProvenanceStore:
             "object": dict(row),
             "events": [dict(x) for x in conn.execute("SELECT * FROM events WHERE object_id=? ORDER BY id", (object_id,)).fetchall()],
             "claims": [dict(x) for x in conn.execute("SELECT * FROM claims WHERE object_id=? ORDER BY id", (object_id,)).fetchall()],
+            "supplement_requests": [
+                dict(r) | {"materials": [dict(m) | {"content": None} for m in conn.execute(
+                    "SELECT id,request_id,filename,sha256,size,uploaded_by,created_at FROM supplement_materials WHERE request_id=? ORDER BY id",
+                    (r["id"],)).fetchall()]}
+                for r in conn.execute(
+                    """SELECT sr.* FROM supplement_requests sr JOIN claims c ON c.id=sr.claim_id
+                       WHERE c.object_id=? ORDER BY sr.id""", (object_id,)).fetchall()
+            ],
         }
         conn.execute(
             "INSERT INTO object_versions(object_id,version,snapshot,changed_by,created_at) VALUES(?,?,?,?,?)",
             (object_id, row["version"], json.dumps(snapshot, ensure_ascii=False, sort_keys=True), actor, now()),
         )
+
+    def _bump_version(self, conn, object_id):
+        obj = self._object(conn, object_id)
+        next_version = obj["version"] + 1
+        conn.execute("UPDATE objects SET version=?,updated_at=? WHERE id=?", (next_version, now(), object_id))
+        return next_version
 
     def create_object(self, user_id, inventory_no, title, object_type, holder, public_summary):
         inventory_no, title = inventory_no.strip(), title.strip()
@@ -291,21 +323,175 @@ class ProvenanceStore:
                 allowed = CLAIM_TRANSITIONS.get(claim["status"], set())
                 if new_status not in allowed:
                     raise BusinessError(f"不能从 {claim['status']} 直接变更为 {new_status}", 409, "invalid_transition")
+                # 补件项未处理完时，不能进入协商或完成返还；驳回不受影响。
+                if new_status in {"negotiating", "resolved_return"}:
+                    pending = conn.execute(
+                        "SELECT material_category FROM supplement_requests WHERE claim_id=? AND status!='closed' ORDER BY id",
+                        (claim_id,)).fetchall()
+                    if pending:
+                        categories = [r["material_category"] for r in pending]
+                        raise BusinessError(
+                            f"仍有 {len(categories)} 个补件项未核查关闭，缺少类别：{('、'.join(categories))}",
+                            409, "supplement_pending", {"missing_categories": categories},
+                        )
                 conn.execute("UPDATE claims SET status=?,updated_at=? WHERE id=?", (new_status, now(), claim_id))
                 conn.execute(
                     "INSERT INTO claim_reviews(claim_id,reviewer_id,old_status,new_status,note,created_at) VALUES(?,?,?,?,?,?)",
                     (claim_id, user_id, claim["status"], new_status, note.strip(), now()),
                 )
-                new_version = claim["object_id"]
-                obj = self._object(conn, claim["object_id"])
-                next_version = obj["version"] + 1
-                conn.execute("UPDATE objects SET version=?,updated_at=? WHERE id=?", (next_version, now(), claim["object_id"]))
+                next_version = self._bump_version(conn, claim["object_id"])
                 self._snapshot(conn, claim["object_id"], user_id)
                 self._audit(conn, claim["object_id"], user_id, "claim.transition", {"claim_id": claim_id, "from": claim["status"], "to": new_status})
                 return {"claim_id": claim_id, "old_status": claim["status"], "status": new_status, "object_version": next_version}
             except Exception:
                 conn.rollback()
                 raise
+
+    def _get_claim(self, conn, claim_id):
+        claim = conn.execute("SELECT * FROM claims WHERE id=?", (claim_id,)).fetchone()
+        if not claim:
+            raise BusinessError("权利主张不存在", 404, "not_found")
+        return claim
+
+    def create_supplement_request(self, user_id, claim_id, material_category, description):
+        material_category, description = material_category.strip(), description.strip()
+        if not material_category:
+            raise BusinessError("材料类别不能为空", 422, "category_required")
+        if len(description) < 5:
+            raise BusinessError("补件说明至少 5 字", 422, "supplement_description_required")
+        with self.connect() as conn:
+            self._user(conn, user_id, {"reviewer"})
+            claim = self._get_claim(conn, claim_id)
+            if claim["status"] in {"resolved_return", "rejected"}:
+                raise BusinessError("主张已结束，不能再提出补件要求", 409, "claim_closed")
+            cur = conn.execute(
+                """INSERT INTO supplement_requests(claim_id,material_category,description,status,requested_by,created_at)
+                   VALUES(?,?,?,'open',?,?)""",
+                (claim_id, material_category, description, user_id, now()),
+            )
+            next_version = self._bump_version(conn, claim["object_id"])
+            self._snapshot(conn, claim["object_id"], user_id)
+            self._audit(conn, claim["object_id"], user_id, "supplement.request",
+                        {"claim_id": claim_id, "request_id": cur.lastrowid, "category": material_category})
+            return {"id": cur.lastrowid, "claim_id": claim_id, "material_category": material_category,
+                    "status": "open", "object_version": next_version}
+
+    def respond_supplement(self, user_id, request_id, files):
+        # files: [{"filename": ..., "content_b64": ...}, ...]，一次可上传一份或几份材料。
+        if not isinstance(files, list) or not files:
+            raise BusinessError("至少上传一份材料", 422, "material_required")
+        parsed = []
+        for f in files:
+            if not isinstance(f, dict):
+                raise BusinessError("材料条目格式错误", 422, "invalid_material")
+            filename = str(f.get("filename", "")).strip()
+            if not filename:
+                raise BusinessError("文件名不能为空", 422, "invalid_filename")
+            try:
+                content = base64.b64decode(str(f.get("content_b64", "")), validate=True)
+            except (binascii.Error, ValueError):
+                raise BusinessError(f"{filename} 的 content_b64 不是合法 Base64", 422, "invalid_base64")
+            if not content:
+                raise BusinessError(f"{filename} 内容为空", 422, "empty_material")
+            parsed.append((filename, content))
+        with self.connect() as conn:
+            self._user(conn, user_id, {"claimant"})
+            req = conn.execute("SELECT * FROM supplement_requests WHERE id=?", (request_id,)).fetchone()
+            if not req:
+                raise BusinessError("补件项不存在", 404, "not_found")
+            claim = self._get_claim(conn, req["claim_id"])
+            if claim["claimant_id"] != user_id:
+                raise BusinessError("只能回应自己主张下的补件项", 403, "forbidden")
+            if req["status"] == "closed":
+                raise BusinessError("该补件项已由审查员关闭", 409, "request_closed")
+            if claim["status"] in {"resolved_return", "rejected"}:
+                raise BusinessError("主张已结束，不能再上传补件材料", 409, "claim_closed")
+            saved = []
+            for filename, content in parsed:
+                digest = hashlib.sha256(content).hexdigest()
+                cur = conn.execute(
+                    """INSERT INTO supplement_materials(request_id,filename,sha256,size,content,uploaded_by,created_at)
+                       VALUES(?,?,?,?,?,?,?)""",
+                    (request_id, filename, digest, len(content), content, user_id, now()),
+                )
+                saved.append({"id": cur.lastrowid, "filename": filename, "sha256": digest, "size": len(content)})
+            conn.execute(
+                "UPDATE supplement_requests SET status='submitted',responded_at=COALESCE(responded_at,?) WHERE id=?",
+                (now(), request_id),
+            )
+            next_version = self._bump_version(conn, claim["object_id"])
+            self._snapshot(conn, claim["object_id"], user_id)
+            self._audit(conn, claim["object_id"], user_id, "supplement.respond",
+                        {"claim_id": claim["id"], "request_id": request_id, "count": len(saved)})
+            return {"id": request_id, "status": "submitted", "materials": saved, "object_version": next_version}
+
+    def review_supplement(self, user_id, request_id, review_note):
+        # 只有审查员查看材料并填写核查意见后，补件项才能结束；主张人无法自行关闭。
+        if len(review_note.strip()) < 5:
+            raise BusinessError("核查意见至少 5 字", 422, "review_note_required")
+        with self.connect() as conn:
+            self._user(conn, user_id, {"reviewer"})
+            req = conn.execute("SELECT * FROM supplement_requests WHERE id=?", (request_id,)).fetchone()
+            if not req:
+                raise BusinessError("补件项不存在", 404, "not_found")
+            if req["status"] == "closed":
+                raise BusinessError("该补件项已关闭", 409, "request_closed")
+            count = conn.execute("SELECT COUNT(*) AS n FROM supplement_materials WHERE request_id=?", (request_id,)).fetchone()["n"]
+            if count == 0:
+                raise BusinessError("主张人尚未上传材料，无法核查关闭", 409, "no_materials")
+            claim = self._get_claim(conn, req["claim_id"])
+            conn.execute(
+                "UPDATE supplement_requests SET status='closed',reviewed_at=?,reviewed_by=?,review_note=? WHERE id=?",
+                (now(), user_id, review_note.strip(), request_id),
+            )
+            next_version = self._bump_version(conn, claim["object_id"])
+            self._snapshot(conn, claim["object_id"], user_id)
+            self._audit(conn, claim["object_id"], user_id, "supplement.review",
+                        {"claim_id": claim["id"], "request_id": request_id})
+            return {"id": request_id, "status": "closed", "object_version": next_version}
+
+    def download_supplement_material(self, user_id, material_id):
+        with self.connect() as conn:
+            user = self._user(conn, user_id)
+            row = conn.execute(
+                """SELECT m.*, c.claimant_id FROM supplement_materials m
+                   JOIN supplement_requests r ON r.id=m.request_id
+                   JOIN claims c ON c.id=r.claim_id WHERE m.id=?""",
+                (material_id,)).fetchone()
+            if not row:
+                raise BusinessError("材料不存在", 404, "not_found")
+            if user["role"] == "public":
+                raise BusinessError("公众不能查看补件材料", 403, "forbidden")
+            if user["role"] == "claimant" and row["claimant_id"] != user_id:
+                raise BusinessError("只能查看自己主张下的补件材料", 403, "forbidden")
+            return {"id": row["id"], "request_id": row["request_id"], "filename": row["filename"],
+                    "sha256": row["sha256"], "size": row["size"], "content_b64": base64.b64encode(row["content"]).decode()}
+
+    def _supplement_views(self, conn, object_id, user):
+        """按角色组装某藏品下全部主张的补件项。公众只见补件中标记；主张人只见自己的；内部角色见全部细节。"""
+        rows = conn.execute(
+            """SELECT sr.*, c.claimant_id FROM supplement_requests sr
+               JOIN claims c ON c.id=sr.claim_id
+               WHERE c.object_id=? ORDER BY sr.id""", (object_id,)).fetchall()
+        views = []
+        for r in rows:
+            if user["role"] == "public":
+                views.append({"id": r["id"], "claim_id": r["claim_id"], "status": r["status"]})
+                continue
+            if user["role"] == "claimant" and r["claimant_id"] != user["id"]:
+                continue
+            materials = [dict(m) | {"content": None} for m in conn.execute(
+                "SELECT id,filename,sha256,size,uploaded_by,created_at FROM supplement_materials WHERE request_id=? ORDER BY id",
+                (r["id"],)).fetchall()]
+            views.append({
+                "id": r["id"], "claim_id": r["claim_id"],
+                "material_category": r["material_category"], "description": r["description"],
+                "status": r["status"], "requested_by": r["requested_by"], "created_at": r["created_at"],
+                "responded_at": r["responded_at"], "reviewed_at": r["reviewed_at"],
+                "reviewed_by": r["reviewed_by"], "review_note": r["review_note"],
+                "materials": materials,
+            })
+        return views
 
     def get_object(self, user_id, object_id):
         with self.connect() as conn:
@@ -319,10 +505,17 @@ class ProvenanceStore:
                 claims = conn.execute(
                     "SELECT id,claimed_by,desired_outcome,status,created_at FROM claims WHERE object_id=? ORDER BY id", (object_id,)
                 ).fetchall()
+                public_claims = []
+                for c in claims:
+                    pending = conn.execute(
+                        "SELECT COUNT(*) AS n FROM supplement_requests WHERE claim_id=? AND status!='closed'", (c["id"],)
+                    ).fetchone()["n"]
+                    public_claims.append(dict(c) | {"supplement_pending": pending > 0})
                 return {
                     "id": obj["id"], "inventory_no": obj["inventory_no"], "title": obj["title"],
                     "object_type": obj["object_type"], "public_summary": obj["public_summary"], "version": obj["version"],
-                    "events": [dict(e) for e in events], "claims": [dict(c) for c in claims],
+                    "events": [dict(e) for e in events], "claims": public_claims,
+                    "supplement_requests": self._supplement_views(conn, object_id, user),
                 }
             result = {
                 "id": obj["id"], "inventory_no": obj["inventory_no"], "title": obj["title"],
@@ -334,12 +527,18 @@ class ProvenanceStore:
                 "claims": [dict(c) | {"reviews": [dict(r) for r in conn.execute("SELECT * FROM claim_reviews WHERE claim_id=? ORDER BY id", (c["id"],)).fetchall()]}
                            for c in conn.execute("SELECT * FROM claims WHERE object_id=? ORDER BY id", (object_id,)).fetchall()],
                 "unlinked_evidence": [dict(e) for e in conn.execute("SELECT id,filename,sha256,size,visibility FROM evidence WHERE object_id=? AND event_id IS NULL ORDER BY id", (object_id,)).fetchall()],
+                "supplement_requests": self._supplement_views(conn, object_id, user),
             }
+            for c in result["claims"]:
+                c["supplement_pending"] = bool(conn.execute(
+                    "SELECT COUNT(*) AS n FROM supplement_requests WHERE claim_id=? AND status!='closed'", (c["id"],)
+                ).fetchone()["n"])
             if user["role"] == "claimant":
                 # 主张人只看到公开来源事件和自己的主张，不能浏览内部调查材料。
                 result["events"] = [e for e in result["events"] if e["visibility"] == "public"]
                 result["unlinked_evidence"] = []
                 result["claims"] = [c for c in result["claims"] if c["claimant_id"] == user_id]
+                result["supplement_requests"] = [s for s in result["supplement_requests"] if s["claim_id"] in {c["id"] for c in result["claims"]}]
                 for c in result["claims"]:
                     c.pop("claimant_id", None)
             return result
@@ -426,11 +625,22 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts) == 5 and parts[3] == "history" and method == "GET": return self._send(200, store.history_detail(user, object_id, int(parts[4])))
         if len(parts) == 4 and parts[:2] == ["api", "claims"] and parts[3] == "transition" and method == "POST":
             d = self._body(); return self._send(200, store.transition_claim(user, int(parts[2]), d.get("status", ""), d.get("note", "")))
+        if len(parts) == 4 and parts[:2] == ["api", "supplements"] and parts[3] == "respond" and method == "POST":
+            d = self._body(); return self._send(200, store.respond_supplement(user, int(parts[2]), d.get("files", [])))
+        if len(parts) == 4 and parts[:2] == ["api", "supplements"] and parts[3] == "review" and method == "POST":
+            d = self._body(); return self._send(200, store.review_supplement(user, int(parts[2]), d.get("review_note", "")))
+        if len(parts) == 5 and parts[:2] == ["api", "supplement-materials"] and parts[3] == "download" and method == "GET":
+            return self._send(200, store.download_supplement_material(user, int(parts[4])))
+        if len(parts) == 4 and parts[:2] == ["api", "claims"] and parts[3] == "supplements" and method == "POST":
+            d = self._body(); return self._send(201, store.create_supplement_request(user, int(parts[2]), d.get("material_category", ""), d.get("description", "")))
         raise BusinessError("接口不存在", 404, "not_found")
 
     def _handle(self, method):
         try: self._dispatch(method)
-        except BusinessError as exc: self._send(exc.status, {"error": {"code": exc.code, "message": exc.message}})
+        except BusinessError as exc:
+            payload = {"error": {"code": exc.code, "message": exc.message}}
+            if exc.details: payload["error"]["details"] = exc.details
+            self._send(exc.status, payload)
         except (ValueError, TypeError): self._send(400, {"error": {"code": "invalid_path", "message": "路径参数格式错误"}})
         except Exception as exc: self._send(500, {"error": {"code": "internal_error", "message": str(exc)}})
 
