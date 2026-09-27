@@ -1,4 +1,379 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>藏品来源与返还审查</title>
-<style>body{font:16px system-ui;max-width:980px;margin:32px auto;padding:0 16px}select,button{padding:8px;margin:4px}pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}.panel{border:1px solid #bbb;padding:16px;border-radius:8px}</style></head>
-<body><h1>藏品来源与返还审查</h1><div class="panel"><select id="user"><option>staff</option><option>reviewer1</option><option>claimant1</option><option>public</option></select><button onclick="load()">查看当前角色可见藏品</button></div><pre id="out"></pre>
-<script>async function load(){const r=await fetch("/api/objects",{headers:{"X-User-Id":user.value}});out.textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>藏品来源与返还审查</title>
+<style>
+  :root{--line:#bbb;--ink:#1c2430;--muted:#66717f;--bg:#f5f6f8;--brand:#1f5fa8;--warn:#b3261e;--ok:#1c6b3b}
+  *{box-sizing:border-box}
+  body{font:15px/1.55 system-ui,"PingFang SC","Microsoft YaHei",sans-serif;color:var(--ink);max-width:1080px;margin:0 auto;padding:24px 16px 64px;background:#fff}
+  h1{font-size:22px;margin:0 0 12px}
+  h2{font-size:17px;margin:20px 0 8px}
+  h3{font-size:15px;margin:14px 0 6px}
+  .topbar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;border:1px solid var(--line);border-radius:10px;padding:12px 14px;background:var(--bg);margin-bottom:16px}
+  select,button,input,textarea{font:inherit}
+  select,input,textarea{border:1px solid var(--line);border-radius:6px;padding:7px 9px;background:#fff}
+  textarea{width:100%;min-height:56px;resize:vertical}
+  button{border:1px solid var(--brand);background:var(--brand);color:#fff;border-radius:6px;padding:7px 12px;cursor:pointer}
+  button.secondary{background:#fff;color:var(--brand)}
+  button.danger{border-color:var(--warn);background:var(--warn)}
+  button.ghost{border-color:var(--line);background:#fff;color:var(--ink)}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  .role-hint{color:var(--muted);font-size:13px}
+  .layout{display:grid;grid-template-columns:280px 1fr;gap:16px}
+  @media (max-width:860px){.layout{grid-template-columns:1fr}}
+  .panel{border:1px solid var(--line);border-radius:10px;padding:14px}
+  .object-item{border:1px solid var(--line);border-radius:8px;padding:9px 11px;margin-bottom:8px;cursor:pointer;background:#fff}
+  .object-item.active{border-color:var(--brand);box-shadow:0 0 0 2px rgba(31,95,168,.18)}
+  .object-item b{display:block}
+  .muted{color:var(--muted);font-size:13px}
+  .badge{display:inline-block;border-radius:999px;padding:1px 10px;font-size:12px;border:1px solid var(--line);color:var(--muted);background:var(--bg)}
+  .badge.reviewer,.badge.awaiting_materials{border-color:#a16207;color:#854d0e;background:#fef6dd}
+  .badge.negotiating{border-color:#1d4ed8;color:#1d4ed8;background:#eaf1ff}
+  .badge.resolved_return{border-color:var(--ok);color:var(--ok);background:#e9f6ee}
+  .badge.rejected{border-color:var(--warn);color:var(--warn);background:#fdecea}
+  .badge.pending{border-color:#a16207;color:#854d0e;background:#fef6dd}
+  .badge.submitted{border-color:#1d4ed8;color:#1d4ed8;background:#eaf1ff}
+  .badge.closed{border-color:var(--ok);color:var(--ok);background:#e9f6ee}
+  .card{border:1px solid var(--line);border-radius:8px;padding:12px;margin:10px 0;background:#fff}
+  .claim-block{border-left:4px solid var(--brand);padding-left:12px;margin:14px 0}
+  .actions{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0}
+  .toast{position:fixed;right:18px;bottom:18px;max-width:420px;border-radius:8px;padding:11px 14px;color:#fff;box-shadow:0 6px 24px rgba(0,0,0,.22);white-space:pre-wrap;z-index:9}
+  .toast.ok{background:var(--ok)} .toast.err{background:var(--warn)} .toast.info{background:#374151}
+  .guard{border:1px solid var(--warn);background:#fdecea;color:var(--warn);border-radius:8px;padding:9px 12px;margin:8px 0;font-size:14px}
+  .req{border:1px dashed #b9c2cf;border-radius:8px;padding:10px 12px;margin:8px 0;background:#fbfcfe}
+  .file-row{display:flex;justify-content:space-between;gap:8px;align-items:center;border-bottom:1px solid #e6e9ee;padding:5px 0;font-size:13px}
+  .file-row:last-child{border-bottom:0}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  @media (max-width:680px){.grid2{grid-template-columns:1fr}}
+  label{font-size:13px;color:var(--muted);display:block;margin:6px 0 3px}
+  pre.hist{background:#0f172a;color:#d7e3f4;border-radius:8px;padding:12px;overflow:auto;max-height:420px;font-size:12px}
+  .hidden{display:none}
+  .review-note{background:#f3f7fc;border:1px solid #cdddf0;border-radius:6px;padding:7px 9px;margin-top:6px;font-size:13px}
+  .tabs{display:flex;gap:6px;flex-wrap:wrap;margin:6px 0 10px}
+  .tab{border-color:var(--line);background:#fff;color:var(--ink)}
+  .tab.active{border-color:var(--brand);background:var(--brand);color:#fff}
+</style>
+</head>
+<body>
+<h1>博物馆藏品来源与返还审查 · 演示台</h1>
+<div class="topbar">
+  <div>
+    <label style="margin:0">切换演示角色（X-User-Id）</label>
+    <select id="user">
+      <option value="staff">staff · 藏品研究员</option>
+      <option value="reviewer1">reviewer1 · 返还审查员</option>
+      <option value="claimant1">claimant1 · 权利主张人</option>
+      <option value="public">public · 公众访客</option>
+    </select>
+  </div>
+  <button class="secondary" onclick="loadObjects()">刷新</button>
+  <span class="role-hint" id="roleHint"></span>
+</div>
+
+<div class="layout">
+  <div class="panel">
+    <h2 style="margin-top:0">藏品</h2>
+    <div id="objectList"><span class="muted">加载中…</span></div>
+  </div>
+  <div class="panel" id="detailPanel"><span class="muted">请选择左侧藏品。</span></div>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+let objects = [], currentObjectId = null, currentData = null, currentTab = "detail";
+
+const CLAIM_STATUS = {
+  submitted:"已提交", under_review:"审查中", awaiting_materials:"补件中",
+  negotiating:"协商中", resolved_return:"已完成返还", rejected:"已驳回"
+};
+const REQ_STATUS = {pending:"待补件", submitted:"已回应·待核查", closed:"已核查结束"};
+const ROLE_HINT = {
+  staff:"工作人员：只读全部审查与补件记录。",
+  reviewer1:"审查员：提出补件要求、核查材料并结束补件项；有待补件项时协商/完成返还会被拦截，驳回不受限。",
+  claimant1:"主张人：查看自己的待补项，上传一份或多份材料；不能自行关闭补件项。",
+  public:"公众：只能看到主张处于“补件中”，看不到材料类别、说明与内部意见。"
+};
+
+$("user").value = "reviewer1";
+$("user").addEventListener("change", () => { currentObjectId = null; currentTab = "detail"; boot(); });
+
+function toast(msg, kind="info", ms=4200){
+  const t = $("toast");
+  t.textContent = msg; t.className = "toast " + kind; t.classList.remove("hidden");
+  clearTimeout(toast._t); toast._t = setTimeout(() => t.classList.add("hidden"), ms);
+}
+function esc(s){ return String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+function b64(s){ return btoa(unescape(encodeURIComponent(s))); }
+function fmt(ts){ return ts ? esc(ts.replace("T"," ").replace("+00:00","Z")) : ""; }
+
+async function api(path, method="GET", body){
+  const opt = { method, headers:{"X-User-Id":$("user").value} };
+  if(body){ opt.headers["Content-Type"]="application/json"; opt.body = JSON.stringify(body); }
+  const r = await fetch(path, opt);
+  let data = null;
+  try { data = await r.json(); } catch(e) {}
+  if(!r.ok){
+    const err = data && data.error || {};
+    const e = new Error(err.message || ("请求失败 "+r.status));
+    e.code = err.code; e.details = err.details;
+    throw e;
+  }
+  return data;
+}
+
+async function boot(){
+  $("roleHint").textContent = ROLE_HINT[$("user").value] || "";
+  await loadObjects();
+}
+
+async function loadObjects(){
+  const data = await api("/api/objects");
+  objects = data.items || [];
+  if(!objects.find(o => o.id === currentObjectId)) currentObjectId = objects[0]?.id || null;
+  renderObjectList();
+  if(currentObjectId) await loadDetail(); else $("detailPanel").innerHTML = '<span class="muted">没有可查看的藏品。</span>';
+}
+
+function renderObjectList(){
+  if(!objects.length){ $("objectList").innerHTML = '<span class="muted">暂无藏品。</span>'; return; }
+  $("objectList").innerHTML = objects.map(o => `
+    <div class="object-item ${o.id===currentObjectId?"active":""}" onclick="selectObject(${o.id})">
+      <b>${esc(o.inventory_no)} · ${esc(o.title)}</b>
+      <span class="muted">${esc(o.object_type||"")} · v${o.version}</span>
+    </div>`).join("");
+}
+
+async function selectObject(id){ currentObjectId = id; currentTab = "detail"; renderObjectList(); await loadDetail(); }
+
+async function loadDetail(){
+  currentData = await api(`/api/objects/${currentObjectId}`);
+  renderDetail();
+}
+
+function badge(status, map){ return `<span class="badge ${status}">${map[status]||status}</span>`; }
+
+function renderDetail(){
+  const d = currentData, role = $("user").value;
+  const tabs = ["detail"];
+  if(role==="staff" || role==="reviewer1") tabs.push("history");
+  if(!tabs.includes(currentTab)) currentTab = "detail";
+  let html = `
+    <div class="tabs">
+      <button class="tab ${currentTab==="detail"?"active":""}" onclick="currentTab='detail';renderDetail()">审查详情</button>
+      ${tabs.includes("history") ? `<button class="tab ${currentTab==="history"?"active":""}" onclick="switchHistory()">历史快照</button>` : ""}
+    </div>`;
+  if(currentTab === "history"){ $("detailPanel").innerHTML = html + '<div id="historyBox"><span class="muted">加载中…</span></div>'; loadHistory(); return; }
+
+  html += `<h2 style="margin-top:0">${esc(d.inventory_no)} · ${esc(d.title)} <span class="muted">v${d.version}</span></h2>
+    <div class="muted">${esc(d.object_type||"")}${d.current_holder ? " · 持有人："+esc(d.current_holder) : ""}</div>
+    <p>${esc(d.public_summary)}</p>`;
+
+  html += `<h3>公开流转事件（${(d.events||[]).length}）</h3>` + (d.events||[]).map(e =>
+    `<div class="card"><b>${esc(e.event_type)}</b> <span class="muted">${esc(e.date_start)} · ${esc(e.place)}</span><div>${esc(e.description)}</div></div>`
+  ).join("") || '<span class="muted">无公开事件。</span>';
+
+  html += `<h3>权利主张（${(d.claims||[]).length}）</h3>`;
+  html += (d.claims||[]).map((c,i) => renderClaim(c, role)).join("") || '<span class="muted">暂无主张。</span>';
+  $("detailPanel").innerHTML = html;
+}
+
+function missingCats(claim){
+  return (claim.supplement_requests||[]).filter(s => s.status!=="closed").map(s => s.material_category);
+}
+
+function renderClaim(c, role){
+  const missing = role==="public" ? [] : missingCats(c);
+  let h = `<div class="claim-block">
+    <div><b>主张 #${c.id}</b> · ${esc(c.claimed_by)} ${badge(c.status, CLAIM_STATUS)}</div>
+    <div class="muted">诉求：${esc(c.desired_outcome)} · 提出于 ${fmt(c.created_at)}</div>`;
+
+  if(role === "public"){
+    const n = (c.supplement_requests||[]).length;
+    h += `<div class="muted">${c.status==="awaiting_materials" ? "该主张正在补件中。" : n ? "补件记录已归档。" : ""}</div></div>`;
+    return h;
+  }
+
+  if(missing.length && c.status!=="rejected" && c.status!=="resolved_return"){
+    h += `<div class="guard">⛔ 待补件类别：${missing.map(esc).join("、")}。这些项目核查结束前，不能进入协商或完成返还；驳回仍可继续。</div>`;
+  }
+
+  // 审查员：阶段流转
+  if(role === "reviewer1"){
+    h += `<div class="actions">`;
+    if(c.status==="submitted") h += `<button onclick="transition(${c.id},'under_review','进入审查的说明')">受理 → 审查中</button>`;
+    if(c.status==="awaiting_materials") h += `<button onclick="resumeReview(${c.id})">材料已齐 → 恢复审查</button>`;
+    if(c.status==="under_review" || c.status==="awaiting_materials"){
+      h += `<button onclick="guardTransition(${c.id},'negotiating')">进入协商</button>`;
+      h += `<button class="secondary" onclick="guardTransition(${c.id},'resolved_return')">完成返还</button>`;
+      h += `<button class="danger" onclick="transition(${c.id},'rejected','审查后决定驳回该主张')">驳回</button>`;
+    }
+    if(c.status==="negotiating"){
+      h += `<button onclick="guardTransition(${c.id},'resolved_return')">完成返还</button>`;
+      h += `<button class="danger" onclick="transition(${c.id},'rejected','协商失败，予以驳回')">驳回</button>`;
+    }
+    h += `</div>`;
+    if(["under_review","awaiting_materials"].includes(c.status)){
+      h += `<div class="card"><b>提出补件要求</b>
+        <div class="grid2">
+          <div><label>材料类别</label><input id="cat_${c.id}" placeholder="如：亲属关系证明 / 原始收藏凭证"></div>
+          <div><label>补件说明</label><input id="desc_${c.id}" placeholder="说明需要什么、用途是什么（至少 5 字）"></div>
+        </div>
+        <div class="actions"><button onclick="requestSupplement(${c.id})">登记补件要求</button></div></div>`;
+    }
+  }
+
+  // 补件项列表
+  const reqs = c.supplement_requests || [];
+  if(reqs.length){
+    h += `<h3>补件项（${reqs.length}）</h3>`;
+    h += reqs.map(r => renderRequest(r, c, role)).join("");
+  }
+
+  if((c.reviews||[]).length){
+    h += `<details><summary class="muted">审查记录（${c.reviews.length}）</summary>` +
+      c.reviews.map(r => `<div class="review-note"><b>${CLAIM_STATUS[r.old_status]||r.old_status} → ${CLAIM_STATUS[r.new_status]||r.new_status}</b> <span class="muted">${esc(r.reviewer_id)} · ${fmt(r.created_at)}</span><br>${esc(r.note)}</div>`).join("")
+      + `</details>`;
+  }
+  return h + `</div>`;
+}
+
+function renderRequest(r, claim, role){
+  let h = `<div class="req">
+    <div><b>${esc(r.material_category)}</b> ${badge(r.status, REQ_STATUS)} <span class="muted">#${r.id} · ${esc(r.requested_by)} 提出于 ${fmt(r.created_at)}</span></div>
+    <div>${esc(r.description)}</div>`;
+  if(r.materials && r.materials.length){
+    h += `<div style="margin-top:6px"><b class="muted">已上传材料：</b>` +
+      r.materials.map(m => `<div class="file-row"><span>📎 ${esc(m.filename)} <span class="muted">${m.size}B · sha256:${esc(String(m.sha256).slice(0,12))}… · ${esc(m.uploaded_by)}</span></span>
+        <button class="ghost" onclick="viewMaterial(${m.id})">查看</button></div>`).join("") + `</div>`;
+  } else if(role !== "staff") {
+    h += `<div class="muted">尚未收到材料。</div>`;
+  }
+  if(r.status==="closed"){
+    h += `<div class="review-note">✅ 核查意见（${esc(r.reviewed_by)} · ${fmt(r.updated_at)}）：${esc(r.review_note)}</div>`;
+  } else if(role === "claimant1"){
+    h += `<div class="card"><b>回应补件</b>
+      <label>选择一份或几份文件（可多次补交）</label>
+      <input type="file" id="files_${r.id}" multiple>
+      <div class="actions"><button onclick="uploadMaterials(${r.id})">上传材料</button></div></div>`;
+  } else if(role === "reviewer1"){
+    h += `<div class="card"><b>核查材料并结束该项</b>
+      <label>核查意见（至少 5 字；主张人不能自行关闭）</label>
+      <textarea id="note_${r.id}" placeholder="核对文件后填写核查结论"></textarea>
+      <div class="actions"><button onclick="closeRequest(${r.id})">核查结束补件项</button></div></div>`;
+  }
+  return h + `</div>`;
+}
+
+async function requestSupplement(claimId){
+  const cat = $(`cat_${claimId}`).value.trim(), desc = $(`desc_${claimId}`).value.trim();
+  try{
+    await api(`/api/claims/${claimId}/supplements`, "POST", {material_category:cat, description:desc});
+    toast("补件要求已登记，主张进入“补件中”。", "ok");
+    await loadDetail();
+  }catch(e){ toast(e.message, "err"); }
+}
+
+async function uploadMaterials(requestId){
+  const input = $(`files_${requestId}`);
+  if(!input.files.length){ toast("请先选择至少一份文件。", "err"); return; }
+  const files = await Promise.all([...input.files].map(async f => ({
+    filename:f.name, content_b64:b64(String.fromCharCode(...new Uint8Array(await f.arrayBuffer())))
+  })));
+  try{
+    await api(`/api/supplements/${requestId}/materials`, "POST", {files});
+    toast(`已上传 ${files.length} 份材料，等待审查员核查。`, "ok");
+    await loadDetail();
+  }catch(e){ toast(e.message, "err"); }
+}
+
+async function closeRequest(requestId){
+  const note = $(`note_${requestId}`).value.trim();
+  try{
+    await api(`/api/supplements/${requestId}/close`, "POST", {review_note:note});
+    toast("补件项已核查结束。", "ok");
+    await loadDetail();
+  }catch(e){ toast(e.message, "err"); }
+}
+
+async function transition(claimId, status, note){
+  try{
+    await api(`/api/claims/${claimId}/transition`, "POST", {status, note});
+    toast(`主张已变更为：${CLAIM_STATUS[status]||status}`, "ok");
+    await loadDetail();
+  }catch(e){ toast(e.message, "err"); }
+}
+
+async function resumeReview(claimId){
+  const note = prompt("恢复审查说明（至少 5 字）：", "补件材料均已核查，恢复审查。");
+  if(note === null) return;
+  await transition(claimId, "under_review", note);
+}
+
+// 协商/完成返还前由后端统一拦截；这里直接提交并展示后端返回的缺失类别。
+async function guardTransition(claimId, status){
+  const note = prompt(`变更为「${CLAIM_STATUS[status]}」的审查说明（至少 5 字）：`,
+    status==="negotiating" ? "材料齐备，进入返还协商。" : "返还流程完成归档。");
+  if(note === null) return;
+  try{
+    await api(`/api/claims/${claimId}/transition`, "POST", {status, note});
+    toast(`主张已变更为：${CLAIM_STATUS[status]||status}`, "ok");
+    await loadDetail();
+  }catch(e){
+    if(e.code === "supplement_pending" && e.details){
+      toast(`被拦截：还缺这些类别的补件 —— ${e.details.missing_categories.join("、")}`, "err", 6500);
+    } else {
+      toast(e.message, "err", 6500);
+    }
+  }
+}
+
+async function viewMaterial(materialId){
+  try{
+    const m = await api(`/api/supplements/materials/${materialId}`);
+    const bytes = Uint8Array.from(atob(m.content_b64), c => c.charCodeAt(0));
+    let type = "text/plain;charset=utf-8";
+    if(/\.png$/i.test(m.filename)) type = "image/png";
+    if(/\.(jpg|jpeg)$/i.test(m.filename)) type = "image/jpeg";
+    if(/\.pdf$/i.test(m.filename)) type = "application/pdf";
+    const url = URL.createObjectURL(new Blob([bytes], {type}));
+    window.open(url, "_blank");
+  }catch(e){ toast(e.message, "err"); }
+}
+
+async function switchHistory(){ currentTab = "history"; renderDetail(); }
+
+async function loadHistory(){
+  const box = $("historyBox");
+  try{
+    const versions = (await api(`/api/objects/${currentObjectId}/history`)).items || [];
+    box.innerHTML = versions.map(v =>
+      `<div class="file-row"><span>v${v.version} · ${fmt(v.created_at)} · ${esc(v.changed_by)}</span>
+       <button class="ghost" onclick="showVersion(${v.version})">查看快照</button></div>`).join("");
+  }catch(e){ box.innerHTML = `<div class="guard">${esc(e.message)}</div>`; }
+}
+
+async function showVersion(version){
+  const detail = await api(`/api/objects/${currentObjectId}/history/${version}`);
+  const snap = detail.snapshot || {};
+  const reqs = (snap.supplement_requests||[]).map(r => ({
+    id:r.id, claim_id:r.claim_id, 类别:r.material_category, 状态:r.status,
+    说明:r.description, 核查意见:r.review_note, 材料数:(r.materials||[]).length
+  }));
+  const view = {
+    object: snap.object ? {inventory_no:snap.object.inventory_no, title:snap.object.title, status_fields:snap.object.version} : null,
+    claims: (snap.claims||[]).map(c => ({id:c.id, claimed_by:c.claimed_by, status:c.status})),
+    supplement_requests: reqs
+  };
+  const w = window.open("", "_blank", "width=760,height=720");
+  w.document.write(`<!doctype html><meta charset="utf-8"><title>历史快照 v${version}</title>
+    <pre style="font:13px/1.5 system-ui;white-space:pre-wrap;padding:16px">${esc(JSON.stringify(view,null,2))}</pre>`);
+}
+
+boot().catch(e => toast(e.message, "err", 8000));
+</script>
+</body>
+</html>
